@@ -5,6 +5,7 @@
 #include "WiFi.h"
 #include <NTPClient.h>
 #include <time.h>
+#include "I2C_RW.h"
 
 
 
@@ -13,20 +14,29 @@
 ////////////////////////////////////////////////////////////////////
 // TODO 3: Register for openweather account and get API key
 String urlOpenWeather = "https://api.openweathermap.org/data/2.5/weather?";
-String apiKey = "<API_KEY>";
+String apiKey = "ae1cc4a56317121a2c7838925cb037e0";
+int const PIN_SDA = 32;
+int const PIN_SCL = 33;
+int const FREQ = 400000;
 
 // TODO 1: WiFi variables
 String wifiNetworkName = "";
 String wifiPassword = "";
 
+// Temp Hum variables
+
+int lastTemp = 0;
+
 // Change temperature vairables
 bool isCelcius = false;
 bool isDay = true;
+bool isHome = true;
 
 // Zip code screen variables
 signed int zipCode[5] = {9,2,5,4,3};
 static unsigned long screenHeight = 240;
 bool isZipCodeScreen = false;
+bool isTempScreen = false;
 
 
 static unsigned long topRow = 40;
@@ -50,14 +60,29 @@ static HotZone button5_hz_bottom(buttonPadding*5 + buttonWidth*4,topRow+120, (bu
 unsigned long lastTime = 0;
 unsigned long timerDelay = 5000;  // 5000; 5 minutes (300,000ms) or 5 seconds (5,000ms)
 double Celcius(double farenhiet);
+double Farenheit(double celcius);
 
 // LCD variables
 int sWidth;
 int sHeight;
+String prevScreen = "";
 
 // Time Client
 WiFiUDP ntpUDP;
 NTPClient timeClient(ntpUDP, "north-america.pool.ntp.org", 3600, 60000);
+
+
+////////////////////////////////////////////////////////////////////
+// Register Defines
+////////////////////////////////////////////////////////////////////
+#define SHT_I2C_ADDRESS 0x44
+#define VCNL_I2C_ADDRESS 0x60
+#define VCNL_REG_PROX_DATA 0x08
+#define VCNL_ALS_DATA 0x09
+
+#define VCNL_REG_PS_CONFIG 0x03
+#define VCNL_REG_ALS_CONFIG 0x00
+
 
 ////////////////////////////////////////////////////////////////////
 // Method header declarations
@@ -72,6 +97,15 @@ void drawWeatherImage(String iconId, int resizeMult);
 void setup() {
     // Initialize the device
     M5.begin();
+
+    // Connect to Temp/Hum sensor
+    I2C_RW::initI2C(SHT_I2C_ADDRESS, FREQ, PIN_SDA, PIN_SCL);
+
+    // Connect tp VCNL Sensor
+    I2C_RW::initI2C(VCNL_I2C_ADDRESS, FREQ, PIN_SDA, PIN_SCL);
+    I2C_RW::writeReg8Addr16DataWithProof(VCNL_REG_PS_CONFIG, 2, 0x0800, " to enable proximity sensor", false);
+    I2C_RW::writeReg8Addr16DataWithProof(VCNL_REG_ALS_CONFIG, 2, 0x0000, " to enable ambient light sensor", false);
+
     
     // Set screen orientation and get height/width 
     sWidth = M5.Lcd.width();
@@ -96,17 +130,59 @@ void loop() {
 
     M5.update();
 
+    int prox = I2C_RW::readReg8Addr16Data(VCNL_REG_PROX_DATA, 2, " to read proximity data", false);
+    int als = I2C_RW::readReg8Addr16Data(VCNL_ALS_DATA, 2, " to read ambient light data", false);
+    als = als * 0.1;
+
+
+    if(prox >= 30){
+        M5.Lcd.writecommand(ILI9341_DISPOFF);
+    } else {
+        M5.Lcd.writecommand(ILI9341_DISPON);
+    }
+    if(als >= 100){
+        M5.Axp.SetLcdVoltage(2800);
+    } else if(als >=29 && als < 100) {
+        M5.Axp.SetLcdVoltage(2700);
+    } else {
+        M5.Axp.SetLcdVoltage(2500);
+    }
+
+
+
     if(M5.BtnB.wasPressed()){
-        isZipCodeScreen = !isZipCodeScreen;
+        isZipCodeScreen = true;
+        isCelcius = false;
+        isTempScreen = false;
+        isHome = false;
+        prevScreen = "zip";
+
         lastTime = 0;
     } else if(M5.BtnA.wasPressed()){
-        isCelcius = !isCelcius;
+        if(prevScreen == "home"){
+            isCelcius = !isCelcius;
+        }
+        isZipCodeScreen = false;
+        isTempScreen = false;
+        isHome = true;
         lastTime = 0;
+        prevScreen = "home";
+    } else if(M5.BtnC.wasPressed()){
+        isTempScreen = true;
+        isZipCodeScreen = false;
+        if(prevScreen == "temp"){
+            isCelcius = !isCelcius;
+        }
+        isHome = false;
+        lastTime = 0;
+        prevScreen = "temp";
+
     }
     // Only execute every so often
-    if (!isZipCodeScreen) {
+    if (isHome && !isZipCodeScreen && !isTempScreen) {
         if((millis() - lastTime) > timerDelay){
             if (WiFi.status() == WL_CONNECTED) {
+                prevScreen = "home";
 
                 //////////////////////////////////////////////////////////////////
                 // TODO 4: Hardcode the specific city,state,country into the query
@@ -263,7 +339,7 @@ void loop() {
             // Update the last time to NOW
         lastTime = millis();
         }
-    } else if(isZipCodeScreen){
+    } else if(isZipCodeScreen && !isHome && !isTempScreen){
 
         M5.Lcd.fillScreen(BLACK);
 
@@ -445,21 +521,62 @@ void loop() {
                     }
                 }
         }
-        // lastTime = millis();
 
         delay(100);
         
+     } else if(isTempScreen && !isZipCodeScreen && !isHome){
+        
+        if((millis() - lastTime) > timerDelay){
+            
+            float temp, hum;
+
+            I2C_RW::getShtTempHum(&temp, &hum);
+
+            if((int)lastTemp != (int)temp){
+                M5.Lcd.fillScreen(BLACK);
+                int pad = 10;
+                M5.Lcd.setCursor(pad, pad);
+                if((int)temp >= 32){
+                    M5.Lcd.setTextColor(TFT_RED);
+                }else if((int)temp <= 0){
+                    M5.Lcd.setTextColor(TFT_CYAN);
+                } else {
+                    M5.Lcd.setTextColor(TFT_WHITE);
+                }
+                M5.Lcd.setTextSize(3);
+                
+                if(!isCelcius) {
+                    M5.Lcd.printf("TEMP:%0.fF\n", Farenheit(temp));
+                } else {
+                    M5.Lcd.printf("TEMP:%0.fC\n", temp);
+                }
+
+                M5.Lcd.setCursor(pad, M5.Lcd.getCursorY() + pad);
+                M5.Lcd.setTextColor(TFT_WHITE);
+                M5.Lcd.setTextSize(3);
+                hum = (int)hum;
+                M5.Lcd.printf("HUMIDITY:%0.f%s\n", hum, "%");
+
+                timeClient.update();
+                M5.Lcd.setCursor(pad, M5.Lcd.getCursorY()+2);
+                M5.Lcd.setTextSize(1);
+                M5.Lcd.setTextColor(TFT_WHITE);
+                M5.Lcd.print("Last sync time: " + timeClient.getFormattedTime());
+
+                M5.Lcd.setCursor(pad, screenHeight - 10);
+                M5.Lcd.setTextSize(1);
+                M5.Lcd.setTextColor(TFT_WHITE);
+                M5.Lcd.print("Measurements are live readouts from local sensors.");
+                
+            }
+
+            prevScreen = "temp";
+            lastTime = millis();
+            
+        }
      }
 }
 
-// void createButtons(int x, int y, int w, int h){
-//     M5.update();
-//         M5.Lcd.drawRect(x, y, w, h, TFT_WHITE);
-//         M5.Lcd.setTextColor(TFT_WHITE);
-//         M5.Lcd.setTextSize(1);
-//         M5.Lcd.setCursor(x + (w/2), y + (h / 2));
-//         M5.Lcd.print("^");
-// }
 
 /////////////////////////////////////////////////////////////////
 // This method takes in a URL and makes a GET request to the
@@ -491,6 +608,10 @@ String httpGETRequest(const char* serverURL) {
 // Method to convert F to C
 double Celcius(double farenhiet) {
     return (farenhiet - 32) * 5/9;
+}
+
+double Farenheit(double celcius) {
+    return (celcius * 9/5) + 32;
 }
 
 /////////////////////////////////////////////////////////////////
@@ -544,6 +665,7 @@ void drawWeatherImage(String iconId, int resizeMult) {
             }
         }
     }
+
 }
 //////////////////////////////////////////////////////////////////////////////////
 // For more documentation see the following links:
